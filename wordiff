@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Word-level unified diff as HTML, opened in a browser.
+
+Usage:
+  wordiff OLD NEW [--context N] [--output FILE] [--no-browser]
+          [--mode unified|inline] [--normalize nfc] [--ignore-punct]
+  wordiff - NEW       # stdin as old file
+  wordiff OLD -       # stdin as new file
+
+Git / jj integration is via two plain file/dir paths, so this also works
+as a git external diff (7-arg form) and as a jj merge-tool / diff-tool.
+"""
+
+import argparse
+import difflib
+import html
+import os
+import sys
+import tempfile
+import unicodedata
+import webbrowser
+
+MAX_LINES_PER_FILE = 2000
+
+_WORD_JOINERS = ("\u200c", "\u200d")  # ZWNJ, ZWJ
+
+
+def _is_word_char(ch):
+    if ch in _WORD_JOINERS:
+        return True
+    if ch == "_" or ch.isalnum():
+        return True
+    return unicodedata.category(ch).startswith("M")
+
+
+def tokenize(text):
+    """Split into word / whitespace / single-char tokens.
+
+    Combining marks (M*) and ZWJ/ZWNJ stay glued to their word, so an
+    Indic syllable remains one token while punctuation such as
+    the danda stays a separate token.
+    """
+    toks = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            j = i + 1
+            while j < n and text[j].isspace():
+                j += 1
+        elif _is_word_char(ch):
+            j = i + 1
+            while j < n and _is_word_char(text[j]):
+                j += 1
+        else:
+            j = i + 1
+        toks.append(text[i:j])
+        i = j
+    return toks
+
+
+_ZWJ_MARK = '<span class="zw" title="U+200D ZERO WIDTH JOINER">⟨zwj⟩</span>'
+_ZWNJ_MARK = '<span class="zw" title="U+200C ZERO WIDTH NON-JOINER">⟨zwnj⟩</span>'
+
+
+def esc_html(text):
+    """Escape diff content, rendering ZWJ/ZWNJ as visible markers."""
+    return (html.escape(text).replace("\u200d", _ZWJ_MARK).replace("\u200c", _ZWNJ_MARK))
+
+
+def apply_normalization(text, form):
+    if form in (None, "none"):
+        return text
+    return unicodedata.normalize(form.upper(), text)
+
+
+_PUNCT_KEY = "\x00punct\x00"
+
+
+def _tok_key(tok):
+    if tok.strip() == "":
+        return tok
+    if all(unicodedata.category(ch).startswith("P") for ch in tok):
+        return _PUNCT_KEY
+    return tok
+
+
+def _line_key(line):
+    return "".join(
+        ch for ch in line if not unicodedata.category(ch).startswith("P")
+    )
+
+
+def _sm(old_toks, new_toks, ignore_punct):
+    if ignore_punct:
+        return difflib.SequenceMatcher(
+            None, [_tok_key(t) for t in old_toks], [_tok_key(t) for t in new_toks],
+            autojunk=False)
+    return difflib.SequenceMatcher(None, old_toks, new_toks, autojunk=False)
+
+
+def word_diff_pair(old_text, new_text, ignore_punct=False):
+    """Return (old_html, new_html) with word changes in <del>/<ins>."""
+    old_toks = tokenize(old_text)
+    new_toks = tokenize(new_text)
+    sm = _sm(old_toks, new_toks, ignore_punct)
+    old_parts, new_parts = [], []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            esc = "".join(esc_html(t) for t in old_toks[i1:i2])
+            old_parts.append(esc)
+            new_parts.append(esc)
+        elif tag == "delete":
+            old_parts.append("<del>" + "".join(esc_html(t) for t in old_toks[i1:i2]) + "</del>")
+        elif tag == "insert":
+            new_parts.append("<ins>" + "".join(esc_html(t) for t in new_toks[j1:j2]) + "</ins>")
+        else:  # replace
+            old_parts.append("<del>" + "".join(esc_html(t) for t in old_toks[i1:i2]) + "</del>")
+            new_parts.append("<ins>" + "".join(esc_html(t) for t in new_toks[j1:j2]) + "</ins>")
+    return "".join(old_parts), "".join(new_parts)
+
+
+def word_diff_inline(old_text, new_text, ignore_punct=False):
+    """Merged single-line view: equal text once, edits as <del>/<ins>."""
+    old_toks = tokenize(old_text)
+    new_toks = tokenize(new_text)
+    sm = _sm(old_toks, new_toks, ignore_punct)
+    parts = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            parts.append("".join(esc_html(t) for t in old_toks[i1:i2]))
+        elif tag == "delete":
+            parts.append("<del>" + "".join(esc_html(t) for t in old_toks[i1:i2]) + "</del>")
+        elif tag == "insert":
+            parts.append("<ins>" + "".join(esc_html(t) for t in new_toks[j1:j2]) + "</ins>")
+        else:  # replace
+            parts.append("<del>" + "".join(esc_html(t) for t in old_toks[i1:i2]) + "</del>")
+            parts.append("<ins>" + "".join(esc_html(t) for t in new_toks[j1:j2]) + "</ins>")
+    return "".join(parts)
+
+
+def hunk_header(o1, o2, n1, n2):
+    def rng(start0, stop0):
+        length = stop0 - start0
+        if length == 0:
+            return f"{start0},0"
+        return f"{start0 + 1},{length}"
+
+    return f"@@ -{rng(o1, o2)} +{rng(n1, n2)} @@"
+
+
+def diff_lines_html(old_lines, new_lines, context=3, mode="unified", ignore_punct=False):
+    """Unified hunks with word-level highlights. Returns HTML fragment.
+
+    mode="unified": paired changes render as separate -/+ lines.
+    mode="inline": paired changes render as one merged line.
+    ignore_punct: hide changes that touch punctuation only.
+    """
+    if ignore_punct:
+        sm = difflib.SequenceMatcher(
+            None, [_line_key(l) for l in old_lines], [_line_key(l) for l in new_lines],
+            autojunk=False)
+    else:
+        sm = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    groups = list(sm.get_grouped_opcodes(context))
+    if not groups:
+        return '<p class="nodiff">No changes.</p>'
+    out = []
+    for group in groups:
+        # group entries are (tag, i1, i2, j1, j2)
+        o1, o2 = group[0][1], group[-1][2]
+        n1, n2 = group[0][3], group[-1][4]
+        out.append(f'<div class="hunk-header">{html.escape(hunk_header(o1, o2, n1, n2))}</div>')
+        for tag, i1, i2, j1, j2 in group:
+            if tag == "equal":
+                for line in old_lines[i1:i2]:
+                    out.append(f'<div class="line ctx"><span class="sign"> </span>{esc_html(line)}</div>')
+            elif tag in ("replace", "delete", "insert"):
+                olds = old_lines[i1:i2] if tag in ("replace", "delete") else []
+                news = new_lines[j1:j2] if tag in ("replace", "insert") else []
+                paired = min(len(olds), len(news)) if tag == "replace" else 0
+                for k in range(paired):
+                    if mode == "inline":
+                        merged = word_diff_inline(olds[k], news[k], ignore_punct)
+                        out.append(f'<div class="line chg"><span class="sign">~</span>{merged or "&#8203;"}</div>')
+                    else:
+                        oh, nh = word_diff_pair(olds[k], news[k], ignore_punct)
+                        out.append(f'<div class="line del"><span class="sign">-</span>{oh or "&#8203;"}</div>')
+                        out.append(f'<div class="line ins"><span class="sign">+</span>{nh or "&#8203;"}</div>')
+                for line in olds[paired:]:
+                    out.append(f'<div class="line del"><span class="sign">-</span>{esc_html(line) or "&#8203;"}</div>')
+                for line in news[paired:]:
+                    out.append(f'<div class="line ins"><span class="sign">+</span>{esc_html(line) or "&#8203;"}</div>')
+    return "\n".join(out)
+
+
+CSS = """
+body { font-family: monospace; margin: 2em; background: #fff; color: #111; }
+h1 { font-size: 1.1em; }
+h2 { font-size: 1em; margin-top: 2em; border-bottom: 1px solid #ddd; }
+.hunk-header { color: #666; margin: 1em 0 0.3em; }
+.line { white-space: pre-wrap; word-break: break-word; padding: 1px 6px; }
+.sign { color: #999; user-select: none; padding-right: 6px; }
+.ctx { background: #fff; }
+.del { background: #ffeef0; }
+.ins { background: #e6ffec; }
+.chg { background: #fff8e1; }
+del { background: #ffb3ba; text-decoration: none; }
+ins { background: #7bff9e; text-decoration: none; }
+.zw { color: #8250df; background: #eee; border-radius: 3px; padding: 0 2px; font-size: 0.85em; }
+.summary a { text-decoration: none; }
+.nodiff, .note { color: #666; }
+"""
+
+
+def page(title, body):
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>{html.escape(title)}</title>
+<style>{CSS}</style></head>
+<body><h1>{html.escape(title)}</h1>
+{body}
+</body></html>
+"""
+
+
+def read_text(path):
+    if path == "-":
+        data = sys.stdin.buffer.read()
+    else:
+        with open(path, "rb") as f:
+            data = f.read()
+    if b"\x00" in data:
+        return None  # binary
+    return data.decode("utf-8", errors="replace")
+
+
+def capped_lines(text):
+    lines = text.splitlines()
+    if len(lines) > MAX_LINES_PER_FILE:
+        return lines[:MAX_LINES_PER_FILE], True
+    return lines, False
+
+
+def file_section(old_label, new_label, old_text, new_text, context, anchor,
+               mode="unified", ignore_punct=False):
+    if old_text is None or new_text is None:
+        return (f'<h2 id="{anchor}">{esc_html(old_label)} vs {esc_html(new_label)}</h2>\n'
+                '<p class="note">Binary files differ.</p>')
+    old_lines, o_cut = capped_lines(old_text)
+    new_lines, n_cut = capped_lines(new_text)
+    frag = diff_lines_html(old_lines, new_lines, context, mode, ignore_punct)
+    note = ""
+    if o_cut or n_cut:
+        note = f'<p class="note">Truncated to first {MAX_LINES_PER_FILE} lines.</p>'
+    return f'<h2 id="{anchor}">{esc_html(old_label)} vs {esc_html(new_label)}</h2>\n{note}\n{frag}'
+
+
+def build_single(old, new, old_text, new_text, context, mode="unified",
+               ignore_punct=False):
+    frag = file_section(old, new, old_text, new_text, context, "diff", mode, ignore_punct)
+    return page(f"{old} vs {new}", frag)
+
+
+def build_dirs(old_dir, new_dir, context, mode="unified", normalize="none",
+               ignore_punct=False):
+    olds, news = {}, {}
+    for root, _, files in os.walk(old_dir):
+        for fn in files:
+            full = os.path.join(root, fn)
+            olds[os.path.relpath(full, old_dir).replace(os.sep, "/")] = full
+    for root, _, files in os.walk(new_dir):
+        for fn in files:
+            full = os.path.join(root, fn)
+            news[os.path.relpath(full, new_dir).replace(os.sep, "/")] = full
+    rels = sorted(set(olds) | set(news))
+    if not rels:
+        return page(f"{old_dir} vs {new_dir}", '<p class="nodiff">No files.</p>')
+    summary, sections = ["<div class='summary'><ul>"], []
+    for i, rel in enumerate(rels):
+        anchor = f"f{i}"
+        if rel not in news:
+            status = "deleted"
+        elif rel not in olds:
+            status = "added"
+        else:
+            with open(olds[rel], "rb") as f:
+                ob = f.read()
+            with open(news[rel], "rb") as f:
+                nb = f.read()
+            status = "unchanged" if ob == nb else "modified"
+        summary.append(f'<li><a href="#{anchor}">{html.escape(rel)}</a> ({status})</li>')
+        if status == "unchanged":
+            continue
+        elif status == "deleted":
+            t = read_text(olds[rel])
+            frag = file_section(rel, "/dev/null",
+                                apply_normalization(t, normalize) if t is not None else None,
+                                "", context, anchor, mode, ignore_punct)
+        elif status == "added":
+            t = read_text(news[rel])
+            frag = file_section("/dev/null", rel, "",
+                                apply_normalization(t, normalize) if t is not None else None,
+                                context, anchor, mode, ignore_punct)
+        else:
+            frag = file_section(
+                f"a/{rel}", f"b/{rel}",
+                apply_normalization(ob.decode("utf-8", errors="replace"), normalize)
+                if b"\x00" not in ob else None,
+                apply_normalization(nb.decode("utf-8", errors="replace"), normalize)
+                if b"\x00" not in nb else None,
+                context, anchor, mode, ignore_punct,
+            )
+        sections.append(frag)
+    summary.append("</ul></div>")
+    if not sections:
+        sections.append('<p class="nodiff">No changes.</p>')
+    return page(f"{old_dir} vs {new_dir}", "\n".join(summary) + "\n".join(sections))
+
+
+def git_external_argv(argv):
+    """Detect `git diff --ext-diff` 7-arg form among positionals.
+
+    Returns (old, new, old_label, new_label, stripped_argv) or None.
+    Flags such as --output/--no-browser may surround the 7 positionals.
+    """
+    flags_with_value = {"--context", "--output", "--title", "--label-old", "--label-new", "--browser", "--mode", "--normalize"}
+    positionals, positions = [], []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in flags_with_value:
+            i += 2
+            continue
+        if a in ("--no-browser", "--ignore-punct", "-h", "--help"):
+            i += 1
+            continue
+        if a.startswith("-") and a != "-":
+            return None  # unknown flag; let argparse report it
+        positionals.append(a)
+        positions.append(i)
+        i += 1
+    if len(positionals) == 7 and os.path.isfile(positionals[1]) and os.path.isfile(positionals[4]):
+        path, old_hex, new_hex = positionals[0], positionals[2], positionals[5]
+        stripped = [argv[0]] + [x for idx, x in enumerate(argv[1:], 1) if idx not in positions]
+        stripped += [positionals[1], positionals[4]]
+        return positionals[1], positionals[4], f"a/{path}@{old_hex[:7]}", f"b/{path}@{new_hex[:7]}", stripped
+    return None
+
+
+def main():
+    ext = git_external_argv(sys.argv)
+    parse_argv = ext[4] if ext else None
+    parser = argparse.ArgumentParser(description="Word-level unified diff as HTML in a browser.")
+    parser.add_argument("old", nargs="?", help="old file/dir (or - for stdin)")
+    parser.add_argument("new", nargs="?", help="new file/dir (or - for stdin)")
+    parser.add_argument("--context", type=int, default=3)
+    parser.add_argument("--output", help="write HTML here instead of a temp file")
+    parser.add_argument("--no-browser", action="store_true", help="don't open a browser")
+    parser.add_argument("--title")
+    parser.add_argument("--label-old")
+    parser.add_argument("--label-new")
+    parser.add_argument("--browser", help="browser command, e.g. --browser 'chromium --ozone-platform=x11 --disable-gpu'")
+    parser.add_argument("--mode", choices=["unified", "inline"], default="unified",
+                        help="unified shows -/+ line pairs; inline merges each change into one line")
+    parser.add_argument("--normalize", choices=["none", "nfc", "nfd", "nfkc", "nfkd"],
+                        default="none", help="unicode-normalize both inputs before diffing")
+    parser.add_argument("--ignore-punct", action="store_true",
+                        help="hide changes that touch punctuation only")
+    args = parser.parse_args(parse_argv[1:] if parse_argv else None)
+
+    if ext:
+        old, new, lo, ln, _ = ext
+        old_label = args.label_old or lo
+        new_label = args.label_new or ln
+    else:
+        if not args.old or not args.new:
+            parser.error("need OLD and NEW (or run via git external diff)")
+        old, new = args.old, args.new
+        old_label = args.label_old or old
+        new_label = args.label_new or new
+
+    if old != "-" and new != "-" and os.path.isdir(old) and os.path.isdir(new):
+        html_doc = build_dirs(old, new, args.context, args.mode, args.normalize, args.ignore_punct)
+        if args.title:
+            html_doc = html_doc.replace(html.escape(f"{old} vs {new}"), html.escape(args.title))
+    elif old != "-" and new != "-" and (os.path.isdir(old) or os.path.isdir(new)):
+        sys.exit("error: OLD and NEW must both be files or both be directories")
+    else:
+        old_text = read_text(old)
+        new_text = read_text(new)
+        if old_text is None or new_text is None:
+            html_doc = page(args.title or "binary files differ",
+                            "<p class='note'>Binary files differ.</p>")
+        else:
+            title = args.title or f"{old_label} vs {new_label} ({args.mode})"
+            old_text = apply_normalization(old_text, args.normalize)
+            new_text = apply_normalization(new_text, args.normalize)
+            frag = file_section(old_label, new_label, old_text, new_text, args.context,
+                                "diff", args.mode, args.ignore_punct)
+            html_doc = page(title, frag)
+
+    if args.output:
+        out = args.output
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+    else:
+        fd, out = tempfile.mkstemp(prefix="wordiff-", suffix=".html")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+    print(out, flush=True)
+    if not args.no_browser:
+        url = "file://" + os.path.abspath(out)
+        try:
+            if args.browser:
+                import shlex
+                import subprocess
+
+                subprocess.Popen(shlex.split(args.browser) + [url])
+            else:
+                ok = webbrowser.open(url)
+                if not ok:
+                    raise RuntimeError("webbrowser.open returned false")
+        except Exception as e:  # browser failure must not lose the diff
+            print(f"wordiff: wrote {out} but browser launch failed: {e}", file=sys.stderr)
+            print("wordiff: open the file manually, or retry with --no-browser / --browser", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
