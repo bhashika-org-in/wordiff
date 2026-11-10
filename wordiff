@@ -140,6 +140,97 @@ def word_diff_inline(old_text, new_text, ignore_punct=False):
     return "".join(parts)
 
 
+# Largest replace block (lines per side) diffed as one token stream.
+# Whole-block matching aligns text that moved across line boundaries, but
+# SequenceMatcher slows down sharply on very popular tokens, so bigger
+# blocks keep the old positional line pairing.
+_BLOCK_MAX_LINES = 8
+
+
+def _block_stream(lines):
+    """Token stream for whole-block diffing with newline separators.
+
+    Lines are tokenized separately so each separator stays its own token;
+    assumes lines hold no newlines (as from str.splitlines). Returns
+    (tokens, owner) where owner maps each token to its line index, or -1
+    for a separator.
+    """
+    toks, owner = [], []
+    for idx, line in enumerate(lines):
+        if idx:
+            toks.append("\n")
+            owner.append(-1)
+        for tok in tokenize(line):
+            toks.append(tok)
+            owner.append(idx)
+    return toks, owner
+
+
+def _block_rows(seg_lines, tag, sign):
+    """Render per-line (kind, token) segments, wrapping changed runs."""
+    rows = []
+    for segs in seg_lines:
+        parts, buf, cur = [], [], None
+        for kind, tok in segs:
+            if cur is None:
+                cur = kind
+            if kind != cur:
+                text = "".join(esc_html(t) for t in buf)
+                parts.append(f"<{tag}>{text}</{tag}>" if cur == "chg" else text)
+                buf, cur = [], kind
+            buf.append(tok)
+        if buf:
+            text = "".join(esc_html(t) for t in buf)
+            parts.append(f"<{tag}>{text}</{tag}>" if cur == "chg" else text)
+        rows.append(
+            f'<div class="line {tag}"><span class="sign">{sign}</span>'
+            f'{"".join(parts) or "&#8203;"}</div>'
+        )
+    return rows
+
+
+def _replace_block_rows(olds, news, mode, ignore_punct):
+    """Render one line-level replace block with whole-block word diffing.
+
+    Matching the block's tokens as a whole aligns text that moved across
+    line boundaries instead of pairing unrelated lines by position.
+    """
+    old_toks, old_owner = _block_stream(olds)
+    new_toks, new_owner = _block_stream(news)
+    opcodes = _sm(old_toks, new_toks, ignore_punct).get_opcodes()
+    if mode == "inline":
+        parts = []
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == "equal":
+                parts.append("".join(esc_html(t) for t in old_toks[i1:i2]))
+            elif tag == "delete":
+                parts.append("<del>" + "".join(esc_html(t) for t in old_toks[i1:i2]) + "</del>")
+            elif tag == "insert":
+                parts.append("<ins>" + "".join(esc_html(t) for t in new_toks[j1:j2]) + "</ins>")
+            else:
+                parts.append("<del>" + "".join(esc_html(t) for t in old_toks[i1:i2]) + "</del>"
+                             "<ins>" + "".join(esc_html(t) for t in new_toks[j1:j2]) + "</ins>")
+        merged = "".join(parts)
+        return [f'<div class="line chg"><span class="sign">~</span>{merged or "&#8203;"}</div>']
+    old_segs, new_segs = [[] for _ in olds], [[] for _ in news]
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag in ("equal", "delete", "replace"):
+            kind = "eq" if tag == "equal" else "chg"
+            for pos in range(i1, i2):
+                if old_owner[pos] >= 0:
+                    old_segs[old_owner[pos]].append((kind, old_toks[pos]))
+        if tag in ("equal", "insert", "replace"):
+            kind = "eq" if tag == "equal" else "chg"
+            for pos in range(j1, j2):
+                if new_owner[pos] >= 0:
+                    new_segs[new_owner[pos]].append((kind, new_toks[pos]))
+    old_rows = _block_rows(old_segs, "del", "-")
+    new_rows = _block_rows(new_segs, "ins", "+")
+    if len(old_rows) == len(new_rows):
+        return [row for pair in zip(old_rows, new_rows) for row in pair]
+    return old_rows + new_rows
+
+
 def hunk_header(o1, o2, n1, n2):
     def rng(start0, stop0):
         length = stop0 - start0
@@ -179,6 +270,9 @@ def diff_lines_html(old_lines, new_lines, context=3, mode="unified", ignore_punc
             elif tag in ("replace", "delete", "insert"):
                 olds = old_lines[i1:i2] if tag in ("replace", "delete") else []
                 news = new_lines[j1:j2] if tag in ("replace", "insert") else []
+                if tag == "replace" and max(len(olds), len(news)) <= _BLOCK_MAX_LINES:
+                    out.extend(_replace_block_rows(olds, news, mode, ignore_punct))
+                    continue
                 paired = min(len(olds), len(news)) if tag == "replace" else 0
                 for k in range(paired):
                     if mode == "inline":

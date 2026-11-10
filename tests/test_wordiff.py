@@ -60,5 +60,64 @@ class ZwjTest(unittest.TestCase):
         self.assertIn("zwj", wordiff.esc_html("a" + chr(0x200D) + "b"))
 
 
+class CrossLineBlockTest(unittest.TestCase):
+    def test_inline_join_two_lines_into_one(self):
+        old = ["alpha beta", "gamma delta", "same tail"]
+        new = ["alpha beta gamma delta", "same tail"]
+        html = wordiff.diff_lines_html(old, new, context=3, mode="inline")
+        # One merged change row: the moved text must not also linger
+        # as a separate delete row.
+        self.assertEqual(html.count('class="line chg"'), 1)
+        self.assertNotIn('class="line del"', html)
+        self.assertEqual(html.count("gamma delta"), 1)
+        # The join itself is shown as a removed line break.
+        self.assertIn("<del>\n</del>", html)
+
+    def test_inline_reword_across_line_boundary(self):
+        old = ["story start sande-", "hanam middle end.", "next para same."]
+        new = ["story start sandehanam middle end.", "next para same."]
+        html = wordiff.diff_lines_html(old, new, context=3, mode="inline")
+        self.assertEqual(html.count('class="line chg"'), 1)
+        self.assertNotIn('class="line del"', html)
+        self.assertIn("<ins>sandehanam</ins>", html)
+        # The untouched tail must not be swallowed into a giant insert.
+        self.assertNotIn("<ins>sandehanam middle end.</ins>", html)
+
+    def test_unified_join_shows_move_without_highlights(self):
+        old = ["alpha beta", "gamma delta", "same tail"]
+        new = ["alpha beta gamma delta", "same tail"]
+        html = wordiff.diff_lines_html(old, new, context=3)
+        self.assertEqual(html.count('class="line del"'), 2)
+        self.assertEqual(html.count('class="line ins"'), 1)
+        self.assertNotIn("<del>", html)
+        # Only the join itself (newline turned into a space) is marked.
+        self.assertIn(
+            '<div class="line ins"><span class="sign">+</span>'
+            "alpha beta<ins> </ins>gamma delta</div>",
+            html,
+        )
+        self.assertNotIn("<ins> gamma delta</ins>", html)
+
+    def test_single_line_pair_is_unchanged(self):
+        old, new = ["hello brave world"], ["hello bright world"]
+        self.assertIn(
+            '<div class="line del"><span class="sign">-</span>'
+            "hello <del>brave</del> world</div>",
+            wordiff.diff_lines_html(old, new, context=0),
+        )
+        self.assertIn(
+            '<div class="line chg"><span class="sign">~</span>'
+            "hello <del>brave</del><ins>bright</ins> world</div>",
+            wordiff.diff_lines_html(old, new, context=0, mode="inline"),
+        )
+
+    def test_large_block_keeps_positional_pairing(self):
+        old = [f"old line {i} here" for i in range(20)]
+        new = [f"new line {i} there" for i in range(20)]
+        html = wordiff.diff_lines_html(old, new, context=0, mode="inline")
+        # Too big for whole-block matching: falls back to one row per line.
+        self.assertEqual(html.count('class="line chg"'), 20)
+
+
 if __name__ == "__main__":
     unittest.main()
